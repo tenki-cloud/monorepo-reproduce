@@ -19,7 +19,7 @@ jobs:
     runs-on: tenki-standard-autoscale
     strategy:
       matrix:
-        app: [vercel-test-app1, vercel-test-app2, vercel-test-app3, vercel-test-app4, vercel-test-app5]
+        app: [vercel-test-app1, vercel-test-app2, vercel-test-app3, vercel-test-app4, vercel-test-app5, vercel-test-app6, vercel-test-app7, vercel-test-app8, vercel-test-app9, vercel-test-app10, vercel-test-app11, vercel-test-app12, vercel-test-app13, vercel-test-app14, vercel-test-app15, vercel-test-app16, vercel-test-app17, vercel-test-app18, vercel-test-app19, vercel-test-app20]
       fail-fast: false
     steps:
       - name: Checkout code
@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        app: [vercel-test-app1, vercel-test-app2, vercel-test-app3, vercel-test-app4, vercel-test-app5]
+        app: [vercel-test-app1, vercel-test-app2, vercel-test-app3, vercel-test-app4, vercel-test-app5, vercel-test-app6, vercel-test-app7, vercel-test-app8, vercel-test-app9, vercel-test-app10, vercel-test-app11, vercel-test-app12, vercel-test-app13, vercel-test-app14, vercel-test-app15, vercel-test-app16, vercel-test-app17, vercel-test-app18, vercel-test-app19, vercel-test-app20]
       fail-fast: false
     steps:
       - name: Checkout code
