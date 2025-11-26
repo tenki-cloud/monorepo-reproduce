@@ -38,7 +38,6 @@ jobs:
         working-directory: ${{ matrix.app }}
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
         run: |
           echo "🚀 Starting deployment for ${{ matrix.app }} on Tenki runner"
           echo "⏰ Start time: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -102,7 +101,6 @@ jobs:
         working-directory: ${{ matrix.app }}
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
         run: |
           echo "🚀 Starting deployment for ${{ matrix.app }} on GitHub runner"
           echo "⏰ Start time: $(date '+%Y-%m-%d %H:%M:%S')"
