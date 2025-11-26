@@ -10,13 +10,13 @@ on:
         options:
           - tenki-standard-autoscale
           - ubuntu-latest
-          - both
 
 jobs:
-  # Test with Tenki runners (potentially same IP)
-  test-tenki-runners:
-    if: ${{ github.event.inputs.test_runner == 'tenki-standard-autoscale' || github.event.inputs.test_runner == 'both' }}
-    runs-on: tenki-standard-autoscale
+  # Single job that deploys all apps using matrix (matches client's pattern)
+  deploy-all-apps:
+    runs-on: ${{ github.event.inputs.test_runner }}
+    timeout-minutes: 30
+    continue-on-error: true
     strategy:
       matrix:
         app: [vercel-test-app1, vercel-test-app2, vercel-test-app3, vercel-test-app4, vercel-test-app5, vercel-test-app6]
@@ -39,7 +39,7 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
-          echo "🚀 Starting deployment for ${{ matrix.app }} on Tenki runner"
+          echo "🚀 Starting deployment for ${{ matrix.app }} on ${{ github.event.inputs.test_runner }}"
           echo "⏰ Start time: $(date '+%Y-%m-%d %H:%M:%S')"
           echo "📍 Runner IP: $(curl -s https://api.ipify.org)"
           echo ""
@@ -76,72 +76,9 @@ jobs:
             exit 1
           fi
 
-  # Test with GitHub-hosted runners (different IPs)
-  test-github-runners:
-    if: ${{ github.event.inputs.test_runner == 'ubuntu-latest' || github.event.inputs.test_runner == 'both' }}
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        app: [vercel-test-app1, vercel-test-app2, vercel-test-app3, vercel-test-app4, vercel-test-app5, vercel-test-app6]
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install dependencies
-        working-directory: ${{ matrix.app }}
-        run: npm install
-
-      - name: Deploy to Vercel
-        working-directory: ${{ matrix.app }}
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: |
-          echo "🚀 Starting deployment for ${{ matrix.app }} on GitHub runner"
-          echo "⏰ Start time: $(date '+%Y-%m-%d %H:%M:%S')"
-          echo "📍 Runner IP: $(curl -s https://api.ipify.org)"
-          echo ""
-          
-          # Verify token is set
-          if [ -z "$VERCEL_TOKEN" ]; then
-            echo "❌ VERCEL_TOKEN is not set!"
-            exit 1
-          fi
-          
-          # Install Vercel CLI
-          npm install -g vercel@latest
-          
-          # Deploy to Vercel with token
-          DEPLOYMENT_START=$(date +%s)
-          
-          # Use --token flag AND ensure it's quoted properly
-          vercel deploy --token="${VERCEL_TOKEN}" --yes 2>&1 | tee /tmp/deploy-output.log
-          DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
-          
-          DEPLOYMENT_END=$(date +%s)
-          DURATION=$((DEPLOYMENT_END - DEPLOYMENT_START))
-          
-          echo ""
-          echo "⏱️  Deployment duration: ${DURATION}s"
-          echo "⏰ End time: $(date '+%Y-%m-%d %H:%M:%S')"
-          
-          if [ $DEPLOY_EXIT_CODE -eq 0 ]; then
-            echo "✅ Deployment successful for ${{ matrix.app }}"
-          else
-            echo "❌ Deployment failed for ${{ matrix.app }}"
-            echo "📋 Error output:"
-            cat /tmp/deploy-output.log
-            exit 1
-          fi
-
-  # Summary job to analyze results
+  # Summary job to show results
   summary:
-    needs: [test-tenki-runners, test-github-runners]
+    needs: [deploy-all-apps]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -151,23 +88,17 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## Test Configuration" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner tested:** ${{ github.event.inputs.test_runner }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Apps deployed:** 6 apps in parallel using matrix strategy" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pattern:** Single job with matrix (matches client's ci.yml)" >> $GITHUB_STEP_SUMMARY
           echo "- **Test date:** $(date)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ needs.test-tenki-runners.result }}" != "skipped" ]; then
-            echo "## Tenki Runners Result" >> $GITHUB_STEP_SUMMARY
-            echo "**Status:** ${{ needs.test-tenki-runners.result }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ "${{ needs.test-github-runners.result }}" != "skipped" ]; then
-            echo "## GitHub Runners Result" >> $GITHUB_STEP_SUMMARY
-            echo "**Status:** ${{ needs.test-github-runners.result }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "## Deployment Result" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ needs.deploy-all-apps.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
           echo "## What to Look For" >> $GITHUB_STEP_SUMMARY
           echo "- ❌ **Rate limit errors:** Look for 429 status codes or 'rate limit exceeded' messages" >> $GITHUB_STEP_SUMMARY
           echo "- ⏱️  **Timing differences:** Significant delays may indicate throttling" >> $GITHUB_STEP_SUMMARY
-          echo "- 🔄 **Retry behavior:** Multiple retry attempts suggest rate limiting" >> $GITHUB_STEP_SUMMARY
-          echo "- 📍 **IP addresses:** All Tenki runners should show same/similar IPs, GitHub runners should be different" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔄 **Queue messages:** 'Queued...' indicates hitting concurrent build limits" >> $GITHUB_STEP_SUMMARY
+          echo "- 📍 **IP addresses:** Check if all matrix jobs show same IP (Tenki) vs different IPs (GitHub)" >> $GITHUB_STEP_SUMMARY
