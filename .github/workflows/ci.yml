@@ -1,0 +1,740 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  check-project-ids:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: ./ci/check-project-ids.sh
+
+  check-translations:
+    runs-on: tenki-standard-autoscale
+    if: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Track main branch
+        run: 'git branch --track main origin/main'
+
+      - name: Extract translations
+        run: pnpm exec nx run-many --target=extract-translations --no-cloud --parallel=1
+
+      - name: Check for uncommited translations
+        # Check git status to see if there are any uncommited translations
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "There are uncommited translations"
+            git status
+            exit 1
+          fi
+
+  apply-schema:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Track main branch
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: 'git branch --track main origin/main'
+
+      - name: Derive appropriate SHAs for base and head for `nx affected` commands on main branch
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: nrwl/nx-set-shas@v4
+
+      - name: Apply schema main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          NEON_API_KEY: ${{ SECRETS.NEON_API_KEY }}
+          BRANCH_NAME: main
+          NX_BASE: ${{ env.NX_BASE }}
+          NX_HEAD: ${{ env.NX_HEAD }}
+        run: ./ci/apply-schema.sh
+
+      - name: Apply schema branch
+        if: ${{ github.ref != 'refs/heads/main' }}
+        env:
+          NEON_API_KEY: ${{ SECRETS.NEON_API_KEY }}
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: ./ci/apply-schema.sh
+
+  vercel-main-deployment-plan:
+    runs-on: tenki-standard-autoscale
+    if: ${{ github.ref == 'refs/heads/main' }}
+    outputs:
+      projects-matrix: ${{ steps.deployment-plan.outputs.projects-matrix }}
+      has-projects: ${{ steps.deployment-plan.outputs.has-projects }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Derive appropriate SHAs for base and head for `nx affected` commands on main branch
+        uses: nrwl/nx-set-shas@v4
+
+      - name: Generate deployment plan
+        id: deployment-plan
+        env:
+          NX_BASE: ${{ env.NX_BASE }}
+          NX_HEAD: ${{ env.NX_HEAD }}
+        run: |
+          ./ci/vercel-deployments.sh --prod main
+
+  vercel-main-deployment:
+    needs: [vercel-main-deployment-plan, main]
+    if: ${{ github.ref == 'refs/heads/main' && needs.vercel-main-deployment-plan.outputs.has-projects == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      matrix:
+        project: ${{ fromJson(needs.vercel-main-deployment-plan.outputs.projects-matrix) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Deploy project
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+          VERCEL_TOKEN: ${{ SECRETS.VERCEL_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ SECRETS.SENTRY_TOKEN }}
+          CROWDIN_API_TOKEN: ${{ SECRETS.CROWDIN_API_TOKEN }}
+        run: |
+          echo "📋 Deploying ${{ matrix.project }}..."
+          echo "=================================================="
+
+          APP_PATH=""
+          if [ -d "customers/${{ matrix.project }}" ]; then
+            APP_PATH="customers/${{ matrix.project }}"
+          elif [ -d "apps/${{ matrix.project }}" ]; then
+            APP_PATH="apps/${{ matrix.project }}"
+          else
+            echo "❌ Project directory not found for ${{ matrix.project }}"
+            exit 1
+          fi
+
+          PROJECT_ID=$(jq -r '.projectId' "$APP_PATH/project.json")
+
+          if [ "$PROJECT_ID" == "null" ] || [ -z "$PROJECT_ID" ]; then
+            echo "❌ Project ID not found in $APP_PATH/project.json"
+            exit 1
+          fi
+
+          # Use tee to show logs and capture them
+          ./ci/deploy-to-vercel.sh "$PROJECT_ID" team_HleEwbs8mbEvEjDjvVoCJEoA "$APP_PATH" "${{ matrix.project }}" --prod main 2>&1 | tee /tmp/deploy-output.log
+          DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "=================================================="
+          echo "Deployment completed with exit code: $DEPLOY_EXIT_CODE"
+
+          # Always create deployment results directory and artifact
+          mkdir -p /tmp/deployment-results
+
+          if [ $DEPLOY_EXIT_CODE -eq 0 ]; then
+            echo "✅ Deployed ${{ matrix.project }} successfully"
+            echo "{\"project\": \"${{ matrix.project }}\", \"status\": \"success\"}" > "/tmp/deployment-results/${{ matrix.project }}.json"
+          else
+            echo "❌ Failed to deploy ${{ matrix.project }}"
+            echo "💡 Check the logs above for error details"
+            echo "{\"project\": \"${{ matrix.project }}\", \"status\": \"failed\"}" > "/tmp/deployment-results/${{ matrix.project }}.json"
+            echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Upload deployment result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: main-deployment-result-${{ matrix.project }}
+          path: /tmp/deployment-results/${{ matrix.project }}.json
+          retention-days: 1
+
+      - name: Fail job if deployment failed
+        if: env.DEPLOY_FAILED == 'true'
+        run: |
+          echo "❌ Marking main deployment job as failed for ${{ matrix.project }}"
+          echo "🔄 Other matrix jobs will continue running due to continue-on-error and fail-fast: false"
+          echo "📊 Artifact has been uploaded and will be included in deployment check"
+          exit 1
+
+  vercel-main-deployment-check:
+    needs: [vercel-main-deployment-plan, vercel-main-deployment]
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.vercel-main-deployment-plan.outputs.has-projects == 'true' }}
+    runs-on: tenki-standard-autoscale
+    steps:
+      - name: Download all deployment results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: main-deployment-result-*
+          path: /tmp/deployment-results
+          merge-multiple: true
+
+      - name: Check for deployment failures
+        run: |
+          echo "🔍 Checking main branch deployment results..."
+
+          FAILED_COUNT=0
+          FAILED_PROJECTS=()
+
+          # Check all deployment result files
+          for result_file in /tmp/deployment-results/*.json; do
+            if [ -f "$result_file" ]; then
+              PROJECT=$(jq -r '.project' "$result_file")
+              STATUS=$(jq -r '.status' "$result_file")
+
+              if [ "$STATUS" = "failed" ]; then
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                FAILED_PROJECTS+=("$PROJECT")
+              fi
+            fi
+          done
+
+          echo "📊 Main Branch Deployment Results:"
+          echo "- Failed deployments: $FAILED_COUNT"
+
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo "❌ The following main branch deployments failed:"
+            for project in "${FAILED_PROJECTS[@]}"; do
+              echo "  - $project"
+            done
+            echo ""
+            echo "🚫 Main branch deployment FAILED"
+            echo "💡 Check the job logs for detailed error information"
+            exit 1
+          else
+            echo "✅ All main branch deployments completed successfully"
+            echo "🎉 Main branch deployment PASSED"
+          fi
+
+  branch-preview-plan:
+    runs-on: tenki-standard-autoscale
+    if: ${{ github.ref != 'refs/heads/main' }}
+    outputs:
+      projects-matrix: ${{ steps.deployment-plan.outputs.projects-matrix }}
+      has-projects: ${{ steps.deployment-plan.outputs.has-projects }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Track main branch
+        run: 'git branch --track main origin/main'
+
+      - name: Generate deployment plan
+        id: deployment-plan
+        run: |
+          ./ci/vercel-deployments.sh --preview ${{ github.event.pull_request.number }} ${{ github.head_ref }}
+          if [ -n "$projects-matrix" ]; then
+            echo "has-projects=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-projects=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get affected projects
+        run: ./ci/affected-projects.sh ${{ github.head_ref }}
+
+      - uses: actions/github-script@v6
+        id: get_issue_number
+        with:
+          script: |
+            if (context.issue.number) {
+              // Return issue number if present
+              return context.issue.number;
+            } else {
+              // Otherwise return issue number from commit
+              return (
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  commit_sha: context.sha,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                })
+              ).data[0].number;
+            }
+          result-encoding: string
+
+      - name: PR Comment
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          filePath: /tmp/pr-comment
+          comment_tag: affected-projects
+          pr_number: ${{ steps.get_issue_number.outputs.result }}
+
+  branch-preview:
+    needs: branch-preview-plan
+    if: ${{ github.ref != 'refs/heads/main' && needs.branch-preview-plan.outputs.has-projects == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      matrix:
+        project: ${{ fromJson(needs.branch-preview-plan.outputs.projects-matrix) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Track main branch
+        run: 'git branch --track main origin/main'
+
+      - name: Deploy project
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+          VERCEL_TOKEN: ${{ SECRETS.VERCEL_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ SECRETS.SENTRY_TOKEN }}
+          CROWDIN_API_TOKEN: ${{ SECRETS.CROWDIN_API_TOKEN }}
+        run: |
+          echo "Starting deployment for ${{ matrix.project }} at $(date '+%Y-%m-%d %H:%M:%S')"
+
+          APP_PATH=""
+          if [ -d "customers/${{ matrix.project }}" ]; then
+            APP_PATH="customers/${{ matrix.project }}"
+          elif [ -d "apps/${{ matrix.project }}" ]; then
+            APP_PATH="apps/${{ matrix.project }}"
+          else
+            echo "❌ Project directory not found for ${{ matrix.project }}"
+            exit 1
+          fi
+
+          PROJECT_ID=$(jq -r '.projectId' "$APP_PATH/project.json")
+
+          if [ "$PROJECT_ID" == "null" ] || [ -z "$PROJECT_ID" ]; then
+            echo "❌ Project ID not found in $APP_PATH/project.json"
+            exit 1
+          fi
+
+          # Run deployment and show logs in real-time, but capture output for URL extraction
+          echo "📋 Deploying ${{ matrix.project }}..."
+          echo "=================================================="
+
+          # Use tee to show logs and capture them
+          ./ci/deploy-to-vercel.sh "$PROJECT_ID" team_HleEwbs8mbEvEjDjvVoCJEoA "$APP_PATH" "${{ matrix.project }}" "" "${{ github.event.pull_request.number }}" "${{ github.head_ref }}" 2>&1 | tee /tmp/deploy-output.log
+          DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "=================================================="
+          echo "Deployment completed with exit code: $DEPLOY_EXIT_CODE"
+
+          # Always create deployment results directory and artifact
+          mkdir -p /tmp/deployment-results
+
+          if [ $DEPLOY_EXIT_CODE -eq 0 ]; then
+            echo "✅ Deployed ${{ matrix.project }} successfully"
+
+            # Check if project has a custom domain in project.json
+            PROJECT_DOMAIN=$(jq -r '.domain // empty' "$APP_PATH/project.json")
+
+            DEPLOYMENT_URL=""
+            if [ -n "$PROJECT_DOMAIN" ]; then
+              # Look for custom domain URL in the output (e.g., https://4104.upsell.is)
+              DEPLOYMENT_URL=$(grep -oE "https://[0-9]+\.$PROJECT_DOMAIN" /tmp/deploy-output.log | tail -1)
+            fi
+
+            # Fall back to vercel.app URL if no custom domain or custom domain URL not found
+            if [ -z "$DEPLOYMENT_URL" ]; then
+              DEPLOYMENT_URL=$(grep -E "https://.*\.vercel\.app" /tmp/deploy-output.log | head -1 | sed 's/.*\(https:\/\/[^ ]*\.vercel\.app\).*/\1/')
+            fi
+
+            if [ -n "$DEPLOYMENT_URL" ]; then
+              echo "🔗 Deployment URL: $DEPLOYMENT_URL"
+              echo "{\"project\": \"${{ matrix.project }}\", \"url\": \"$DEPLOYMENT_URL\", \"status\": \"success\"}" > "/tmp/deployment-results/${{ matrix.project }}.json"
+            else
+              echo "⚠️ Could not extract deployment URL from output"
+              echo "{\"project\": \"${{ matrix.project }}\", \"url\": null, \"status\": \"success\"}" > "/tmp/deployment-results/${{ matrix.project }}.json"
+            fi
+          else
+            echo "❌ Failed to deploy ${{ matrix.project }}"
+            echo "💡 Check the logs above for error details"
+
+            # Save failed deployment result
+            echo "{\"project\": \"${{ matrix.project }}\", \"url\": null, \"status\": \"failed\"}" > "/tmp/deployment-results/${{ matrix.project }}.json"
+
+            # Mark this step as failed but continue to artifact upload
+            echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Upload deployment result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deployment-result-${{ matrix.project }}
+          path: /tmp/deployment-results/${{ matrix.project }}.json
+          retention-days: 1
+
+      - name: Fail job if deployment failed
+        if: env.DEPLOY_FAILED == 'true'
+        run: |
+          echo "❌ Marking job as failed for ${{ matrix.project }}"
+          echo "🔄 Other matrix jobs will continue running due to continue-on-error and fail-fast: false"
+          echo "📊 Artifact has been uploaded and will be included in deployment summary"
+          exit 1
+
+  branch-deployment-summary:
+    needs: [branch-preview-plan, branch-preview]
+    if: ${{ always() && github.ref != 'refs/heads/main' && needs.branch-preview-plan.outputs.has-projects == 'true' }}
+    runs-on: tenki-standard-autoscale
+    steps:
+      - name: Download all deployment results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deployment-result-*
+          path: /tmp/deployment-results
+          merge-multiple: true
+
+      - name: Generate deployment summary
+        id: deployment-summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "## 🚀 Deployment Results" > /tmp/deployment-summary.md
+          echo "" >> /tmp/deployment-summary.md
+
+          SUCCESS_COUNT=0
+          FAILED_COUNT=0
+          TOTAL_COUNT=0
+
+          # Get job details from GitHub API to create direct links to failed jobs
+          echo "🔍 Fetching job details from GitHub API..."
+          curl -s -H "Authorization: token $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" > /tmp/jobs.json
+
+          # Process all deployment result files
+          for result_file in /tmp/deployment-results/*.json; do
+            if [ -f "$result_file" ]; then
+              PROJECT=$(jq -r '.project' "$result_file")
+              URL=$(jq -r '.url' "$result_file")
+              STATUS=$(jq -r '.status' "$result_file")
+
+              TOTAL_COUNT=$((TOTAL_COUNT + 1))
+
+              if [ "$STATUS" = "success" ]; then
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                if [ "$URL" != "null" ] && [ -n "$URL" ]; then
+                  echo "- ✅ **$PROJECT**: [View Deployment]($URL)" >> /tmp/deployment-summary.md
+                else
+                  echo "- ✅ **$PROJECT**: Deployed successfully" >> /tmp/deployment-summary.md
+                fi
+              else
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+
+                # Find the specific job URL for this failed project
+                JOB_URL=$(jq -r --arg project "$PROJECT" '.jobs[] | select(.name | contains("branch-preview (\($project))")) | .html_url' /tmp/jobs.json)
+
+                if [ "$JOB_URL" != "null" ] && [ -n "$JOB_URL" ]; then
+                  echo "- ❌ **$PROJECT**: [Deployment failed - View logs]($JOB_URL)" >> /tmp/deployment-summary.md
+                else
+                  # Fallback to workflow run URL
+                  WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  echo "- ❌ **$PROJECT**: [Deployment failed - View logs]($WORKFLOW_RUN_URL)" >> /tmp/deployment-summary.md
+                fi
+              fi
+            fi
+          done
+
+          echo "" >> /tmp/deployment-summary.md
+          echo "**Summary**: $SUCCESS_COUNT successful, $FAILED_COUNT failed out of $TOTAL_COUNT total deployments." >> /tmp/deployment-summary.md
+
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo "" >> /tmp/deployment-summary.md
+            echo "💡 **Tip**: Click on failed deployment links above to view detailed error logs for each specific deployment." >> /tmp/deployment-summary.md
+          fi
+
+          echo "" >> /tmp/deployment-summary.md
+          echo "*Generated at $(date)*" >> /tmp/deployment-summary.md
+
+          # Output for next step
+          echo "success-count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "failed-count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+          echo "total-count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+
+      - uses: actions/github-script@v6
+        id: get_issue_number
+        with:
+          script: |
+            if (context.issue.number) {
+              return context.issue.number;
+            } else {
+              return (
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  commit_sha: context.sha,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                })
+              ).data[0].number;
+            }
+          result-encoding: string
+
+      - name: Update PR comment with deployment results
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          filePath: /tmp/deployment-summary.md
+          comment_tag: deployment-results
+          pr_number: ${{ steps.get_issue_number.outputs.result }}
+
+  branch-deployment-check:
+    needs: [branch-preview-plan, branch-preview, branch-deployment-summary]
+    if: ${{ always() && github.ref != 'refs/heads/main' && needs.branch-preview-plan.outputs.has-projects == 'true' }}
+    runs-on: tenki-standard-autoscale
+    steps:
+      - name: Download all deployment results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deployment-result-*
+          path: /tmp/deployment-results
+          merge-multiple: true
+
+      - name: Check for deployment failures
+        run: |
+          echo "🔍 Checking deployment results to determine CI status..."
+
+          FAILED_COUNT=0
+          FAILED_PROJECTS=()
+
+          # Check all deployment result files
+          for result_file in /tmp/deployment-results/*.json; do
+            if [ -f "$result_file" ]; then
+              PROJECT=$(jq -r '.project' "$result_file")
+              STATUS=$(jq -r '.status' "$result_file")
+
+              if [ "$STATUS" = "failed" ]; then
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                FAILED_PROJECTS+=("$PROJECT")
+              fi
+            fi
+          done
+
+          echo "📊 Deployment Results Summary:"
+          echo "- Failed deployments: $FAILED_COUNT"
+
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo "❌ The following deployments failed:"
+            for project in "${FAILED_PROJECTS[@]}"; do
+              echo "  - $project"
+            done
+            echo ""
+            echo "🚫 CI will be marked as FAILED to prevent unsafe merging"
+            echo "💡 Check the PR comment and job logs for detailed error information"
+            exit 1
+          else
+            echo "✅ All deployments completed successfully"
+            echo "🎉 CI will be marked as PASSED - safe to merge"
+          fi
+
+  branch:
+    runs-on: tenki-standard-autoscale
+    if: ${{ github.ref != 'refs/heads/main' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Track main branch
+        run: 'git branch --track main origin/main'
+
+      - name: Format
+        run: pnpm exec nx format:check --no-cloud
+
+      - name: Run all tests
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+          VERCEL_TOKEN: ${{ SECRETS.VERCEL_TOKEN }}
+          NEON_API_KEY: ${{ SECRETS.NEON_API_KEY }}
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: ./ci/run-tests.sh
+
+  main:
+    runs-on: tenki-standard-autoscale
+    if: ${{ github.ref == 'refs/heads/main' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Setup Sentry CLI
+        uses: mathieu-bour/setup-sentry-cli@v1
+        with:
+          token: ${{ SECRETS.SENTRY_TOKEN }}
+          organization: viska-dev
+          project: cloudflare
+
+      - name: Derive appropriate SHAs for base and head for `nx affected` commands on main branch
+        uses: nrwl/nx-set-shas@v4
+
+      - name: Run format main
+        env:
+          NX_BASE: ${{ env.NX_BASE }}
+          NX_HEAD: ${{ env.NX_HEAD }}
+        run: pnpm exec nx format:check --base=${{ env.NX_BASE }} --head=${{ env.NX_HEAD }} --no-cloud
+
+      - name: Run all tests
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+          VERCEL_TOKEN: ${{ SECRETS.VERCEL_TOKEN }}
+          NEON_API_KEY: ${{ SECRETS.NEON_API_KEY }}
+          BRANCH_NAME: main
+          NX_BASE: ${{ env.NX_BASE }}
+          NX_HEAD: ${{ env.NX_HEAD }}
+        run: ./ci/run-tests.sh
+
+      - name: Setup fly
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - id: 'auth'
+        uses: google-github-actions/auth@v1.1.1
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+
+      - name: Authorize Docker push
+        run: gcloud auth configure-docker europe-west2-docker.pkg.dev
+
+      - name: Deploy
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          VERCEL_TOKEN: ${{ SECRETS.VERCEL_TOKEN }}
+          NODE_OPTIONS: '--max-old-space-size=4096'
+          NX_BASE: ${{ env.NX_BASE }}
+          NX_HEAD: ${{ env.NX_HEAD }}
+          SENTRY_AUTH_TOKEN: ${{ SECRETS.SENTRY_TOKEN }}
+          CROWDIN_API_TOKEN: ${{ SECRETS.CROWDIN_API_TOKEN }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: ./ci/master-deploy.sh ${{ env.NX_BASE }} ${{ env.NX_HEAD }} ${{ github.sha }}
